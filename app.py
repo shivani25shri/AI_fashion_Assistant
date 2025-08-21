@@ -6,7 +6,7 @@ from google.genai import types
 import re
 import json
 
-# ── Gemini SDK setup ─────────────────────────────────────────────────────────
+# Gemini SDK setup
 client = genai.Client(api_key="AIzaSyDaGNVY8FBCDhzq0qWq4kt1QCZecS40boA")
 
 st.set_page_config(page_title="Fashion Recommender", layout="wide")
@@ -18,10 +18,10 @@ def init_models():
 
 detector, seg = init_models()
 
-# ── Mode selector ────────────────────────────────────────────────────────────
+#  Mode selector
 mode = st.radio("Choose Input Mode:", ["Person Images", "Flat-lay Outfit"], horizontal=True)
 
-# ── Upload ───────────────────────────────────────────────────────────────────
+#  Upload 
 files = st.file_uploader(
     "Upload up to 5 images…", type=["jpg","jpeg","png"], accept_multiple_files=True
 )[:5]
@@ -37,7 +37,7 @@ if files:
             img.thumbnail((600,600), Image.LANCZOS)
             st.image(img, width=img.width)
 
-            # --- segmentation depending on mode ---
+            # segmentation depending on mode 
             if mode == "Person Images":
                 crops = segment_clothes(detector, seg, img)
             else:
@@ -58,7 +58,7 @@ if files:
             st.warning("No segmented items to recommend outfits from.")
             st.stop()
 
-        # --- Build prompt ---
+        #Build prompt 
         descs = "\n".join(f"{i+1}. {item['section']}" for i, item in enumerate(all_items))
         system = "You are a fashion stylist assistant."
         user = (
@@ -72,7 +72,7 @@ if files:
             "[{\"combo\": [indices], \"description\": \"…\"}, …]."
         )
 
-        # --- Call Gemini ---
+        #Call Gemini
         response = client.models.generate_content(
             model="gemini-2.0-flash",
             contents=user,
@@ -94,7 +94,7 @@ if files:
             st.text(raw)
             st.stop()
 
-        # --- Display ---
+        # Display
         st.markdown("### Outfit Recommendations")
         for idx, rec in enumerate(recommendations, start=1):
             combo = rec.get("combo", [])
