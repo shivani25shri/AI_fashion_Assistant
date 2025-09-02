@@ -1,110 +1,51 @@
+import os
 import streamlit as st
 from PIL import Image
-from pipeline import load_models, segment_clothes, segment_flatlay 
-from google import genai
-from google.genai import types
-import re
-import json
+from pipeline import load_models, segment_image_with_hf
 
-# ── Gemini SDK setup ─────────────────────────────────────────────────────────
-client = genai.Client(api_key="AIzaSyDaGNVY8FBCDhzq0qWq4kt1QCZecS40boA")
+st.set_page_config(page_title="HF BG Removal + Clothing Segmentation", layout="wide")
+st.title("🧵 HF Background Removal → Clothing Segmentation")
 
-st.set_page_config(page_title="Fashion Recommender", layout="wide")
-st.title("👗 Fashion Segmenter & Recommender")
-
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def init_models():
-    return load_models(device=0)
+    # -1 CPU; set 0 to use CUDA:0 if available
+    return load_models(device=-1)
 
-detector, seg = init_models()
+_, seg = init_models()
 
-# ── Mode selector ────────────────────────────────────────────────────────────
-mode = st.radio("Choose Input Mode:", ["Person Images", "Flat-lay Outfit"], horizontal=True)
-
-# ── Upload ───────────────────────────────────────────────────────────────────
 files = st.file_uploader(
-    "Upload up to 5 images…", type=["jpg","jpeg","png"], accept_multiple_files=True
-)[:5]
+    "Upload images…", type=["jpg","jpeg","png"], accept_multiple_files=True
+)
 
 if files:
-    st.write(f"Processing {len(files)} file{'s' if len(files)>1 else ''}")
-    if st.button("Segment & Recommend"):
-        all_items = []
-        for f in files:
-            st.markdown("---")
-            st.subheader(f"Image: {f.name}")
-            img = Image.open(f).convert("RGB")
-            img.thumbnail((600,600), Image.LANCZOS)
-            st.image(img, width=img.width)
+    for f in files:
+        st.markdown("---")
+        st.subheader(f"Image: {f.name}")
+        img = Image.open(f).convert("RGB")
 
-            # --- segmentation depending on mode ---
-            if mode == "Person Images":
-                crops = segment_clothes(detector, seg, img)
-            else:
-                crops = segment_flatlay(seg, img)
-
-            if not crops:
-                st.warning("No garments found.")
-                continue
-
-            cols = st.columns(len(crops))
-            for (sec, data), col in zip(crops.items(), cols):
-                with col:
-                    st.subheader(sec.title())
-                    st.image(data["rgba"], width=140)
-                    all_items.append({"section": sec, "rgba": data["rgba"]})
-
-        if not all_items:
-            st.warning("No segmented items to recommend outfits from.")
-            st.stop()
-
-        # --- Build prompt ---
-        descs = "\n".join(f"{i+1}. {item['section']}" for i, item in enumerate(all_items))
-        system = "You are a fashion stylist assistant."
-        user = (
-            f"I have these {len(all_items)} garment items:\n"
-            f"{descs}\n\n"
-            f"Only use indices between 1 and {len(all_items)}. "
-            "Please suggest 3 cohesive outfit combinations. "
-            "Each combo should include at least one topwear and one bottomwear, "
-            "and optionally footwear or accessories. "
-            "Return valid JSON: "
-            "[{\"combo\": [indices], \"description\": \"…\"}, …]."
-        )
-
-        # --- Call Gemini ---
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.7
-            )
-        )
-        raw = response.text
-
-        # strip code fences
-        m = re.search(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", raw, re.S)
-        json_str = m.group(1) if m else raw
-
+        # run: HF BG remover → HF SegFormer → buckets
         try:
-            recommendations = json.loads(json_str)
-        except json.JSONDecodeError:
-            st.error("Failed to parse recommendations JSON")
-            st.text(raw)
-            st.stop()
+            crops = segment_image_with_hf(seg, img, hf_token=os.getenv("HF_TOKEN"))
+        except Exception as e:
+            st.error(f"Failed: {e}")
+            continue
 
-        # --- Display ---
-        st.markdown("### Outfit Recommendations")
-        for idx, rec in enumerate(recommendations, start=1):
-            combo = rec.get("combo", [])
-            desc  = rec.get("description", "")
-            st.subheader(f"Option {idx}")
-            st.write(desc)
+        # show original + buckets
+        st.image(img, caption="Original", use_container_width=True)
 
-            valid = [i for i in combo if 1 <= i <= len(all_items)]
-            cols = st.columns(len(valid))
-            for col, item_idx in zip(cols, valid):
-                item = all_items[item_idx-1]
-                with col:
-                    st.image(item["rgba"], caption=item["section"].title(), width=180)
+        order  = ["topwear", "bottomwear", "footwear", "accessories"]
+        labels = ["Topwear", "Bottomwear", "Footwear", "Accessories"]
+        cols = st.columns(4)
+
+        # fixed widths so tiny items (shoes/bags) aren’t upscaled to huge pixelated blobs
+        size_by_section = {"topwear": 260, "bottomwear": 260, "footwear": 180, "accessories": 160}
+
+        for col, key, label in zip(cols, order, labels):
+            with col:
+                st.markdown(f"**{label}**")
+                if key in crops:
+                    col.image(crops[key]["rgba"], width=size_by_section[key])
+                else:
+                    col.write("—")
+else:
+    st.info("Upload 1+ images to begin.")
