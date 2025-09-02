@@ -1,0 +1,14 @@
+streamlit
+google-genai
+pymongo[srv]
+pillow>=9.5.0
+requests
+transformers
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.6.12
+ultralytics>=8.0.100
+scikit-learn>=1.2.2
+pandas>=2.0.1
+numpy>=1.25.0
+huggingface_hub>=0.22.2
