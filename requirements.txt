@@ -1,3 +1,4 @@
+# --- your existing deps ---
 streamlit
 google-genai
 pymongo[srv]
@@ -12,3 +13,16 @@ scikit-learn>=1.2.2
 pandas>=2.0.1
 numpy>=1.25.0
 huggingface_hub>=0.22.2
+
+# --- FastAPI + server ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9   # for file uploads
+
+# --- used by our HF background-removal & segmentation pipeline ---
+gradio_client>=0.16.0     # calls the not-lain/background-removal Space
+opencv-python-headless>=4.8.0.74  # cv2 without GUI
+
+# Optional but recommended (local fallback BG removal)
+rembg>=2.0.56
+onnxruntime>=1.16.0       # CPU runtime used by rembg
