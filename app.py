@@ -1,236 +1,373 @@
 # app.py
-from __future__ import annotations
-
-import io
-import os
-import base64
-import zipfile
-from pathlib import Path
-from typing import List, Dict, Any
-
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Form
-from fastapi.responses import (
-    JSONResponse,
-    StreamingResponse,
-    PlainTextResponse,
-    HTMLResponse,
-)
+import os, io, json, traceback
+import streamlit as st
 from PIL import Image
 
-from pipeline import load_models, segment_image_with_hf
-from vlm_recommender_qwen import LocalVLM_Qwen
+# ---- local modules ----
+from pipeline import load_models, load_caption_model, segment_and_describe
+from supabase_utils import (
+    get_client,
+    upload_image_to_storage,
+    add_catalog_items_bulk,
+    recommend_from_supabase,
+)
 
+st.set_page_config(page_title="👗 Complete the Look – Catalog + Cross Recommendations",
+                   page_icon="🛍️", layout="wide")
 
-app = FastAPI(title="Wardrobe Segmentation API", version="1.1.0")
+st.title("👗 Complete the Look – Catalog Indexing + Cross-Category Recommender")
 
-SEG_PIPELINE = None
-QWEN: LocalVLM_Qwen | None = None
-HF_TOKEN = os.getenv("HF_TOKEN")
+# -----------------------------------------------------------------------------------
+# ENV CHECK (Supabase)
+# -----------------------------------------------------------------------------------
+def supabase_ok() -> bool:
+    try:
+        _ = get_client()
+        return True
+    except Exception as e:
+        st.error(f"Supabase not ready: {e}")
+        return False
 
+# -----------------------------------------------------------------------------------
+# MODELS (cached)
+# -----------------------------------------------------------------------------------
+@st.cache_resource
+def init_models():
+    _, seg_pipeline = load_models(device=-1)          # CPU segformer
+    cap_proc, cap_model = load_caption_model("cpu")   # BLIP on CPU
+    return seg_pipeline, cap_proc, cap_model
 
-@app.on_event("startup")
-def _load_models():
-    global SEG_PIPELINE
-    _, SEG_PIPELINE_LOCAL = load_models(device=-1)  # CPU default
-    SEG_PIPELINE = SEG_PIPELINE_LOCAL
-    print("Device set to use cpu")
+seg_pipeline, cap_proc, cap_model = init_models()
 
+# -----------------------------------------------------------------------------------
+# SIDEBAR: USER PREFS
+# -----------------------------------------------------------------------------------
+st.sidebar.header("Your Preferences")
+user_id = st.sidebar.text_input("User ID (required)", value="demo-user")
+preferred_colors = st.sidebar.multiselect(
+    "Preferred colors (optional)",
+    ["black","white","grey","gray","beige","cream","off white",
+     "blue","navy","light blue","red","green","olive","brown",
+     "yellow","purple","pink","orange","khaki"],
+    default=[]
+)
+preferred_fit = st.sidebar.multiselect(
+    "Preferred fit (optional)",
+    ["slim","regular","relaxed","oversized","tapered","straight"],
+    default=[]
+)
+st.sidebar.caption("These are used as soft filters when picking from your catalog.")
 
-# ---------------- helpers ----------------
-def _read_upload_to_pil(f: UploadFile) -> Image.Image:
-    raw = f.file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail=f"Empty file: {f.filename}")
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+if not user_id:
+    st.warning("Enter a User ID in the sidebar to proceed.")
 
+# -----------------------------------------------------------------------------------
+# 1) CATALOG INDEXING
+# -----------------------------------------------------------------------------------
+st.header("1) Index your **catalog images** to Supabase")
+st.write("Upload 1+ images that represent your personal catalog. "
+         "We’ll segment garments → caption each crop with BLIP → upload each crop to Supabase Storage → insert rows to the `catalog` table.")
 
-def _png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
-    return buf.getvalue()
+catalog_files = st.file_uploader(
+    "Upload catalog images",
+    type=["jpg","jpeg","png","webp"],
+    accept_multiple_files=True
+)
 
+index_btn = st.button("📤 Index Catalog to Supabase", use_container_width=True)
 
-def _to_data_url(img: Image.Image) -> str:
-    return "data:image/png;base64," + base64.b64encode(_png_bytes(img)).decode("ascii")
-
-
-def _collect_items_for_vlm(seg: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    for sec, data in seg.items():
-        if sec == "full":
-            continue
-        items.append({"section": sec, "rgba": data["rgba"]})
-    return items
-
-
-def _render_gallery_html(per_file_results: List[Dict[str, Any]]) -> str:
-    # Inline CSS; simple grid.
-    css = """
-    <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;
-           background:#0b0e12;color:#eef; margin:20px}
-      h1{font-size:22px;margin:0 0 12px}
-      .file{margin:18px 0;padding:16px;border:1px solid #2a2f3a;border-radius:12px;background:#11151b}
-      .name{opacity:.8;margin-bottom:10px}
-      .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
-      .card{background:#0f1320;border:1px solid #252a36;border-radius:12px;padding:10px}
-      .cap{font-size:12px;opacity:.7;margin:6px 0 0}
-      img{width:100%;height:auto;border-radius:8px;background:#222}
-      .badge{display:inline-block;background:#6a5acd33;border:1px solid #6a5acd55;color:#cfd;
-             border-radius:6px;padding:2px 8px;font-size:12px;margin-left:8px}
-    </style>
+def _short_attrs_from_caption(desc: str):
     """
-    # Build cards
-    parts = ["<html><head><meta charset='utf-8'><title>Segment Gallery</title>", css, "</head><body>"]
-    parts.append("<h1>Segment Gallery</h1>")
-    for entry in per_file_results:
-        parts.append(f"<div class='file'><div class='name'>{entry['file']}</div>")
-        parts.append("<div class='grid'>")
-        for sec in ["full", "topwear", "bottomwear", "footwear", "accessories"]:
-            obj = entry.get(sec)
-            if not obj:
-                continue
-            parts.append("<div class='card'>")
-            parts.append(f"<img src='{obj['png']}' alt='{sec}'>")
-            parts.append(f"<div class='cap'>{sec.title()}<span class='badge'>{obj['width']}×{obj['height']}</span></div>")
-            parts.append("</div>")
-        parts.append("</div></div>")
-    parts.append("</body></html>")
-    return "".join(parts)
+    Tiny heuristic to extract attrs from a BLIP caption.
+    Returns {'color': '...', 'type': '...'} best-effort.
+    """
+    d = (desc or "").lower()
+    # color guess
+    colors = ["black","white","grey","gray","beige","cream","off white",
+              "blue","navy","light blue","red","green","olive","brown",
+              "yellow","purple","pink","orange","khaki"]
+    color = next((c for c in colors if c in d), None)
 
+    # type guess
+    keywords = [
+        ("topwear", ["shirt","t-shirt","tee","blouse","top","jacket","coat","hoodie","sweater","cardigan","blazer","dress"]),
+        ("bottomwear", ["jeans","trousers","pants","shorts","skirt","leggings","cargo"]),
+        ("footwear", ["sneaker","shoe","boot","heel","loafer","sandal"]),
+        ("accessories", ["belt","bag","handbag","backpack","hat","cap","scarf","glasses","sunglasses","watch","wallet","necklace","earring"]),
+    ]
+    typ = None
+    for _, words in keywords:
+        for w in words:
+            if w in d:
+                typ = w
+                break
+        if typ: break
+    return {"color": color, "type": typ}
 
-# ---------------- routes ----------------
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "Wardrobe API up. See /docs, or /segment_gallery for an HTML demo."
+def _pick_section(section_key: str, fallback: str, desc: str):
+    """Prefer the detected section; otherwise guess from description."""
+    if section_key in ("topwear","bottomwear","footwear","accessories"):
+        return section_key
+    # Guess from desc
+    d = desc.lower()
+    if any(w in d for w in ["shirt","t-shirt","tee","blouse","top","jacket","coat","hoodie","sweater","cardigan","blazer","dress"]):
+        return "topwear"
+    if any(w in d for w in ["jeans","trousers","pants","shorts","skirt","leggings","cargo"]):
+        return "bottomwear"
+    if any(w in d for w in ["sneaker","shoe","boot","heel","loafer","sandal"]):
+        return "footwear"
+    if any(w in d for w in ["belt","bag","handbag","backpack","hat","cap","scarf","glasses","sunglasses","watch","wallet","necklace","earring"]):
+        return "accessories"
+    return fallback
 
+if index_btn:
+    if not user_id:
+        st.error("Please set a User ID in the sidebar first.")
+    elif not supabase_ok():
+        st.stop()
+    elif not catalog_files:
+        st.warning("Upload at least one catalog image.")
+    else:
+        total_crops = 0
+        all_rows = []
+        with st.spinner("Indexing catalog…"):
+            try:
+                for idx, f in enumerate(catalog_files, 1):
+                    img = Image.open(f).convert("RGB")
+                    st.write(f"Processing catalog image {idx}: **{f.name}**")
+                    results = segment_and_describe(
+                        seg_pipeline, cap_proc, cap_model,
+                        img, hf_token=None, device="cpu",
+                        run_recommender=False
+                    )
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+                    # For each section crop: upload → add to rows
+                    for sec, data in results.items():
+                        if "rgba" not in data:
+                            continue
+                        desc = data.get("description", "garment")
+                        # Upload to storage
+                        try:
+                            url = upload_image_to_storage(sec, data["rgba"], user_id=user_id)
+                        except Exception as e:
+                            st.error(f"Storage upload failed for {sec} in {f.name}: {e}")
+                            continue
 
+                        attrs = _short_attrs_from_caption(desc)
+                        section = _pick_section(sec, fallback="topwear", desc=desc)
+                        row = {
+                            "section": section,
+                            "description": desc,
+                            "image_url": url,
+                            "attrs": attrs,
+                            "extra": {"source_file": f.name},
+                        }
+                        all_rows.append(row)
+                        total_crops += 1
 
-@app.post("/segment")
-def segment(
-    files: List[UploadFile] = File(..., description="One or more image files"),
-    embed_png: bool = Query(False, description="If true, include base64 PNGs in JSON"),
-):
-    if SEG_PIPELINE is None:
-        raise HTTPException(status_code=503, detail="Model not ready")
+                # Bulk insert rows
+                if all_rows:
+                    _ = add_catalog_items_bulk(user_id, all_rows)
+                    st.success(f"Indexed {len(all_rows)} catalog items for user `{user_id}` ✅")
+                else:
+                    st.warning("No garments were detected to index.")
+            except Exception as e:
+                st.error("Catalog indexing failed.")
+                st.code("".join(traceback.format_exc()))
+        if total_crops:
+            st.toast(f"Uploaded {total_crops} segmented pieces to Supabase", icon="✅")
 
-    results = []
-    for f in files:
-        img = _read_upload_to_pil(f)
-        W, H = img.size
-        crops = segment_image_with_hf(SEG_PIPELINE, img, hf_token=HF_TOKEN)
+# -----------------------------------------------------------------------------------
+# 2) QUERY IMAGE → CROSS-CATEGORY RECOMMENDATIONS
+# -----------------------------------------------------------------------------------
+st.header("2) Upload ONE input → get cross-category outfits")
+st.write("We’ll segment your input and make cross-category matches against your **stored catalog**.")
 
-        entry: Dict[str, Any] = {"file": f.filename, "status": "ok", "original_size": [W, H]}
-        for sec, data in crops.items():
-            rgba: Image.Image = data["rgba"]
-            sec_obj: Dict[str, Any] = {
-                "section": sec,
-                "bbox": data.get("bbox", [0, 0, rgba.width, rgba.height]),
-                "width": rgba.width,
-                "height": rgba.height,
-            }
-            if embed_png:
-                sec_obj["png"] = _to_data_url(rgba)
-            entry[sec] = sec_obj
-        results.append(entry)
+query_file = st.file_uploader("Upload an input image", type=["jpg","jpeg","png","webp"], accept_multiple_files=False)
+run_recs = st.button("✨ Recommend Outfits", use_container_width=True)
 
-    return {"results": results}
+def _bias_by_prefs(items, colors, fits):
+    """Soft-bias a list of catalog rows by user-preferred colors/fits."""
+    if not colors and not fits:
+        return items
+    def score(row):
+        s = 0
+        d = (row.get("description") or "").lower()
+        # color bias
+        for c in colors:
+            if c.lower() in d:
+                s += 1
+        # fit bias (looks in text)
+        for f in fits:
+            if f.lower() in d:
+                s += 0.5
+        return s
+    return sorted(items, key=score, reverse=True)
 
+def _choose_target_piece(results: dict):
+    """
+    Choose the primary piece from the query image:
+    prefer topwear or bottomwear (then footwear, accessories).
+    """
+    for sec in ("topwear","bottomwear","footwear","accessories"):
+        if sec in results and "description" in results[sec]:
+            return {"section": sec, "description": results[sec]["description"], "rgba": results[sec].get("rgba")}
+    return None
 
-@app.get("/segment_gallery", response_class=HTMLResponse)
-def segment_gallery_form():
-    # tiny upload form to use from a browser
-    return HTMLResponse("""
-      <html><head><meta charset="utf-8"><title>Segment Gallery</title></head>
-      <body style="font-family:system-ui;margin:30px">
-        <h2>Upload images to see background-removed + categories</h2>
-        <form action="/segment_gallery" method="post" enctype="multipart/form-data">
-          <input type="file" name="files" multiple accept="image/*">
-          <button type="submit">Segment</button>
-        </form>
-        <p>Tip: You can also POST to <code>/segment?embed_png=true</code> for JSON with inline images.</p>
-      </body></html>
-    """)
+def _build_three_combos(target, complements):
+    """
+    Build up to 3 combos: (top+bottom), (+shoes), (+accessory)
+    or if target is bottomwear, reverse (top first).
+    """
+    combos = []
+    tsec = target["section"]
 
+    # complements is dict: {"topwear":[...], "bottomwear":[...], "footwear":[...], "accessories":[...]}
+    # Ensure order for top/bottom depending on target
+    if tsec == "topwear":
+        bot = complements.get("bottomwear", [])
+        shoe = complements.get("footwear", [])
+        acc = complements.get("accessories", [])
+        if bot:
+            combos.append({
+                "combo": ["topwear","bottomwear"],
+                "desc": f"{target['description']} + {bot[0]['description']}",
+                "refs": {"bottomwear": bot[0]}
+            })
+            if shoe:
+                combos.append({
+                    "combo": ["topwear","bottomwear","footwear"],
+                    "desc": f"{target['description']} + {bot[0]['description']} + {shoe[0]['description']}",
+                    "refs": {"bottomwear": bot[0], "footwear": shoe[0]}
+                })
+            if acc:
+                combos.append({
+                    "combo": ["topwear","bottomwear","accessories"],
+                    "desc": f"{target['description']} + {bot[0]['description']} + {acc[0]['description']}",
+                    "refs": {"bottomwear": bot[0], "accessories": acc[0]}
+                })
+    elif tsec == "bottomwear":
+        top = complements.get("topwear", [])
+        shoe = complements.get("footwear", [])
+        acc = complements.get("accessories", [])
+        if top:
+            combos.append({
+                "combo": ["topwear","bottomwear"],
+                "desc": f"{top[0]['description']} + {target['description']}",
+                "refs": {"topwear": top[0]}
+            })
+            if shoe:
+                combos.append({
+                    "combo": ["topwear","bottomwear","footwear"],
+                    "desc": f"{top[0]['description']} + {target['description']} + {shoe[0]['description']}",
+                    "refs": {"topwear": top[0], "footwear": shoe[0]}
+                })
+            if acc:
+                combos.append({
+                    "combo": ["topwear","bottomwear","accessories"],
+                    "desc": f"{top[0]['description']} + {target['description']} + {acc[0]['description']}",
+                    "refs": {"topwear": top[0], "accessories": acc[0]}
+                })
+    else:
+        # If target is footwear or accessories, try to pair with top+bottom if available
+        top = complements.get("topwear", [])
+        bot = complements.get("bottomwear", [])
+        if top and bot:
+            combos.append({
+                "combo": ["topwear","bottomwear", tsec],
+                "desc": f"{top[0]['description']} + {bot[0]['description']} + {target['description']}",
+                "refs": {"topwear": top[0], "bottomwear": bot[0]}
+            })
 
-@app.post("/segment_gallery", response_class=HTMLResponse)
-def segment_gallery(files: List[UploadFile] = File(...)):
-    if SEG_PIPELINE is None:
-        raise HTTPException(status_code=503, detail="Model not ready")
+    return combos[:3]
 
-    per_file_results: List[Dict[str, Any]] = []
-    for f in files:
-        img = _read_upload_to_pil(f)
-        crops = segment_image_with_hf(SEG_PIPELINE, img, hf_token=HF_TOKEN)
+if run_recs:
+    if not user_id:
+        st.error("Please set a User ID in the sidebar first.")
+        st.stop()
+    if not supabase_ok():
+        st.stop()
+    if not query_file:
+        st.warning("Upload one input image first.")
+        st.stop()
 
-        entry: Dict[str, Any] = {"file": f.filename}
-        for sec, data in crops.items():
-            rgba: Image.Image = data["rgba"]
-            entry[sec] = {
-                "png": _to_data_url(rgba),
-                "width": rgba.width,
-                "height": rgba.height,
-            }
-        per_file_results.append(entry)
+    img = Image.open(query_file).convert("RGB")
+    st.subheader("📸 Your Input")
+    st.image(img, width=420)
 
-    return HTMLResponse(_render_gallery_html(per_file_results))
+    with st.spinner("Analyzing input…"):
+        try:
+            qres = segment_and_describe(
+                seg_pipeline, cap_proc, cap_model,
+                img, hf_token=None, device="cpu",
+                run_recommender=False
+            )
+        except Exception as e:
+            st.error(f"Segmentation failed: {e}")
+            st.stop()
 
+    # show detected pieces
+    st.subheader("Detected in Input")
+    for sec, data in qres.items():
+        if "rgba" in data:
+            st.image(data["rgba"], caption=f"{sec} – {data.get('description','N/A')}", width=180)
 
-@app.post("/segment_zip")
-def segment_zip(files: List[UploadFile] = File(...)):
-    if SEG_PIPELINE is None:
-        raise HTTPException(status_code=503, detail="Model not ready")
+    target = _choose_target_piece(qres)
+    if not target:
+        st.warning("No primary garment detected to base recommendations on.")
+        st.stop()
 
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
-        manifest: Dict[str, Any] = {"results": []}
-        for f in files:
-            img = _read_upload_to_pil(f)
-            crops = segment_image_with_hf(SEG_PIPELINE, img, hf_token=HF_TOKEN)
-            stem = Path(f.filename).stem
-            rec: Dict[str, Any] = {"file": f.filename, "sections": {}}
-            for sec, data in crops.items():
-                path = f"{stem}/{sec}.png"
-                z.writestr(path, _png_bytes(data["rgba"]))
-                rec["sections"][sec] = {"path": path, "bbox": data.get("bbox")}
-            manifest["results"].append(rec)
-        z.writestr("manifest.json", _png_bytes(Image.new("RGBA",(1,1))))  # keep zip openable
-        # better: write real JSON
-        z.writestr("manifest.json", __import__("json").dumps(manifest, indent=2).encode())
+    # Query Supabase for complementary pieces
+    with st.spinner("Fetching matches from your catalog…"):
+        comp_raw = recommend_from_supabase(
+            user_id=user_id,
+            target_piece={"section": target["section"], "description": target["description"]},
+            topk=10,  # fetch a few to bias by prefs
+        )
 
-    mem.seek(0)
-    return StreamingResponse(
-        mem, media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=segments.zip"},
+    # Soft-bias by prefs
+    comp_biased = {}
+    for sec, rows in comp_raw.items():
+        comp_biased[sec] = _bias_by_prefs(rows, preferred_colors, preferred_fit)
+
+    combos = _build_three_combos(target, comp_biased)
+
+    st.subheader("✨ Cross-Category Recommendations")
+    if not combos:
+        st.info("Not enough items in your catalog to build outfits. Try indexing more pieces.")
+    else:
+        for i, c in enumerate(combos, 1):
+            st.markdown(f"**Combo {i}:** {c['desc']}")
+            # build visual strip
+            cols = st.columns(len(c["combo"]))
+            # first: show the target piece for top/bottom appropriately
+            for j, sec in enumerate(c["combo"]):
+                with cols[j]:
+                    if sec == target["section"]:
+                        # show the crop from query
+                        if target.get("rgba"):
+                            st.image(target["rgba"], caption=f"query {sec}", width=160)
+                        else:
+                            st.caption(f"query {sec}")
+                    else:
+                        ref = c["refs"].get(sec) if "refs" in c else None
+                        if ref and "image_url" in ref:
+                            st.image(ref["image_url"], caption=f"{sec}", width=160)
+                        else:
+                            st.caption(sec)
+
+    # Export JSON summary
+    export = {
+        "user_id": user_id,
+        "target_piece": {"section": target["section"], "description": target["description"]},
+        "combos": combos,
+    }
+    st.subheader("📦 JSON")
+    st.code(json.dumps(export, indent=2), language="json")
+    st.download_button(
+        "Download JSON",
+        data=io.BytesIO(json.dumps(export, indent=2).encode("utf-8")),
+        file_name="recommendations.json",
+        mime="application/json"
     )
-
-
-@app.post("/recommend")
-def recommend(files: List[UploadFile] = File(...)):
-    if SEG_PIPELINE is None:
-        raise HTTPException(status_code=503, detail="Model not ready")
-
-    global QWEN
-    if QWEN is None:
-        QWEN = LocalVLM_Qwen(device="cpu", max_new_tokens=128, temperature=0.2, max_image_side=320, seed=42, cpu_threads=4)
-
-    all_items: List[Dict[str, Any]] = []
-    per_file: List[Dict[str, Any]] = []
-
-    for f in files:
-        img = _read_upload_to_pil(f)
-        crops = segment_image_with_hf(SEG_PIPELINE, img, hf_token=HF_TOKEN)
-        items = _collect_items_for_vlm(crops)
-        per_file.append({"file": f.filename, "found": [it["section"] for it in items]})
-        all_items.extend(items)
-
-    if not all_items:
-        return {"files": per_file, "recommendations": [], "message": "No garments detected."}
-
-    recs = QWEN.recommend(all_items)
-    return {"files": per_file, "recommendations": recs}
+c
